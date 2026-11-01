@@ -338,4 +338,246 @@ end
 -- 没选中时随机挑附近玩家（不回退自己）
 local function getRandomTarget()
     local myRoot = getMyRoot()
-    if not myRoot th
+    if not myRoot then return nil end
+    local candidates = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player then
+            local c = p.Character
+            local root = c and c:FindFirstChild("HumanoidRootPart")
+            if root then
+                local d = (root.Position - myRoot.Position).Magnitude
+                if d <= TARGET_RANGE then
+                    table.insert(candidates, p)
+                end
+            end
+        end
+    end
+    if #candidates > 0 then
+        return candidates[math.random(1, #candidates)]
+    end
+    return nil
+end
+
+local function collectLimbParts(character)
+    local limbs = {}
+    if not character then return limbs end
+    for _, d in ipairs(character:GetDescendants()) do
+        if d:IsA("BasePart") then
+            table.insert(limbs, d)
+        end
+    end
+    return limbs
+end
+
+-- 把附近物件平均分配给多个目标
+local function distributeParts(targets)
+    if #targets == 0 then return end
+    local myRoot = getMyRoot()
+    if not myRoot then return end
+
+    -- 收集一次物件，排除自己和所有目标的角色
+    local filter = {player.Character}
+    local limbCache = {}
+    for _, t in ipairs(targets) do
+        local c = t.Character
+        if c then
+            table.insert(filter, c)
+            limbCache[t] = collectLimbParts(c)
+        end
+    end
+
+    local params = OverlapParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = filter
+    local near = workspace:GetPartBoundsInRadius(myRoot.Position, RADIUS, params)
+
+    local parts = {}
+    for _, p in ipairs(near) do
+        if p:IsA("BasePart") and not p.Anchored then
+            local model = p:FindFirstAncestorOfClass("Model")
+            local isChar = model and model:FindFirstChildOfClass("Humanoid")
+            if not isChar then
+                table.insert(parts, p)
+            end
+        end
+    end
+
+    if #parts == 0 then return end
+    table.sort(parts, function(a, b)
+        return (a.Position - myRoot.Position).Magnitude < (b.Position - myRoot.Position).Magnitude
+    end)
+    if #parts > MAX_PER_TICK then
+        for i = #parts, MAX_PER_TICK + 1, -1 do
+            parts[i] = nil
+        end
+    end
+
+    -- 轮流分给每个目标，保证公平
+    local n = #targets
+    for i, part in ipairs(parts) do
+        local target = targets[(i - 1) % n + 1]
+        local limbs = limbCache[target]
+        if limbs and #limbs > 0 then
+            local limb = limbs[math.random(1, #limbs)]
+            local tinyOffset = Vector3.new(
+                math.random(-2, 2),
+                math.random(-2, 2),
+                math.random(-2, 2)
+            )
+            local targetPos = limb.Position + tinyOffset
+            local rot = CFrame.Angles(
+                math.random() * math.pi * 2,
+                math.random() * math.pi * 2,
+                math.random() * math.pi * 2
+            )
+            pcall(function()
+                part.CFrame = CFrame.new(targetPos) * rot
+                part.AssemblyLinearVelocity = Vector3.new(
+                    math.random(-5, 5),
+                    math.random(-3, 3),
+                    math.random(-5, 5)
+                )
+            end)
+        end
+    end
+end
+
+-- ===== 主循环 =====
+task.spawn(function()
+    while true do
+        task.wait(TICK_INTERVAL)
+        if active then
+            local targets = {}
+            for p in pairs(selectedPlayers) do
+                if p.Parent and p.Character then
+                    table.insert(targets, p)
+                end
+            end
+            if #targets == 0 then
+                local t = getRandomTarget()
+                if t then table.insert(targets, t) end
+            end
+            if #targets > 0 then
+                distributeParts(targets)
+            end
+        end
+    end
+end)
+
+-- ===== UI 命中 =====
+local function pointInGui(pos, gui, pad)
+    pad = pad or 0
+    local ap = gui.AbsolutePosition
+    local as = gui.AbsoluteSize
+    return pos.X >= ap.X - pad and pos.X <= ap.X + as.X + pad
+       and pos.Y >= ap.Y - pad and pos.Y <= ap.Y + as.Y + pad
+end
+
+local function toggle()
+    active = not active
+    updateButton()
+end
+
+local function togglePanel()
+    playerPanel.Visible = not playerPanel.Visible
+    if playerPanel.Visible then
+        refreshPlayerList()
+    end
+end
+
+closeBtn.Activated:Connect(function()
+    playerPanel.Visible = false
+end)
+
+-- ===== 拖动状态 =====
+local draggingBtn = nil
+local dragMoved = false
+local dragStart, dragStartPos
+
+local draggingPanel = false
+local panelDragStart, panelStartPos
+
+UserInputService.InputBegan:Connect(function(input, processed)
+    if input.UserInputType ~= Enum.UserInputType.Touch
+       and input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+
+    if pointInGui(input.Position, toggleBtn, 6) then
+        draggingBtn = toggleBtn
+        dragMoved = false
+        dragStart = input.Position
+        dragStartPos = toggleBtn.Position
+        return
+    end
+    if pointInGui(input.Position, listToggleBtn, 6) then
+        draggingBtn = listToggleBtn
+        dragMoved = false
+        dragStart = input.Position
+        dragStartPos = listToggleBtn.Position
+        return
+    end
+
+    -- 面板标题栏拖动（排除关闭按钮/全选/清空）
+    if playerPanel.Visible
+       and pointInGui(input.Position, panelHeader)
+       and not pointInGui(input.Position, closeBtn, 2)
+       and not pointInGui(input.Position, selectAllBtn, 2)
+       and not pointInGui(input.Position, clearBtn, 2) then
+        draggingPanel = true
+        panelDragStart = input.Position
+        panelStartPos = playerPanel.Position
+        return
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if input.UserInputType ~= Enum.UserInputType.Touch
+       and input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+
+    if draggingBtn then
+        local delta = input.Position - dragStart
+        if delta.Magnitude > 10 then dragMoved = true end
+        draggingBtn.Position = UDim2.new(
+            dragStartPos.X.Scale, dragStartPos.X.Offset + delta.X,
+            dragStartPos.Y.Scale, dragStartPos.Y.Offset + delta.Y
+        )
+        return
+    end
+
+    if draggingPanel then
+        local delta = input.Position - panelDragStart
+        playerPanel.Position = UDim2.new(
+            panelStartPos.X.Scale, panelStartPos.X.Offset + delta.X,
+            panelStartPos.Y.Scale, panelStartPos.Y.Offset + delta.Y
+        )
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType ~= Enum.UserInputType.Touch
+       and input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+
+    if draggingBtn then
+        local btn = draggingBtn
+        draggingBtn = nil
+        if not dragMoved then
+            if btn == toggleBtn then
+                toggle()
+            elseif btn == listToggleBtn then
+                togglePanel()
+            end
+        end
+        return
+    end
+
+    if draggingPanel then
+        draggingPanel = false
+    end
+end)
+
+-- ===== PC 端 F 键 =====
+UserInputService.InputBegan:Connect(function(input, processed)
+    if processed then return end
+    if input.KeyCode == Enum.KeyCode.F then
+        toggle()
+    end
+end)
